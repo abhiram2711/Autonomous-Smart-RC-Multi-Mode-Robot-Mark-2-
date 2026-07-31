@@ -1,0 +1,242 @@
+#include "BluetoothSerial.h"
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#if !defined(CONFIG_BT_ENABLED) || !defined(CONFIG_BLUEDROID_ENABLED)
+#error Bluetooth is not enabled!
+#endif
+
+BluetoothSerial SerialBT;
+
+// --- OLED Display Setup ---
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+
+// --- Motor Pins ---
+const int PWMA = 12; const int AIN1 = 13; const int AIN2 = 14;
+const int PWMB = 25; const int BIN1 = 26; const int BIN2 = 27;
+
+// --- Sensors & Buttons Pins ---
+const int TRIG_PIN = 19;
+const int ECHO_PIN = 18;
+const int CYCLE_BTN_PIN = 4; // External Push Button
+const int BOOT_BTN_PIN  = 0; // Onboard BOOT Button
+
+// --- System State Variables ---
+enum RobotMode { MODE_MANUAL_RC, MODE_AUTONOMOUS };
+RobotMode selectedMode = MODE_MANUAL_RC; // Selection preview
+RobotMode activeMode   = MODE_MANUAL_RC; // Currently active mode
+
+int currentSpeedPWM = 200; // Speed range: 0 - 255
+char currentDirection = 'S';
+long currentDistance = 999;
+
+bool lastCycleState = HIGH;
+bool lastBootState  = HIGH;
+unsigned long lastSensorTime = 0;
+unsigned long lastSpeedTime  = 0;
+
+// Function Prototypes
+void handleCommand(char cmd);
+void applyMovement();
+void setMotors(int speedLeft, int speedRight);
+long readDistance();
+int getSpeedKmh();
+void sendSpeedToApp();
+void updateOLED(String line1, String line2);
+void runAutoModeLogic();
+
+void setup() {
+  Serial.begin(115200);
+
+  // Motor outputs
+  pinMode(PWMA, OUTPUT); pinMode(AIN1, OUTPUT); pinMode(AIN2, OUTPUT);
+  pinMode(PWMB, OUTPUT); pinMode(BIN1, OUTPUT); pinMode(BIN2, OUTPUT);
+
+  // Ultrasonic pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Button inputs with internal pullups
+  pinMode(CYCLE_BTN_PIN, INPUT_PULLUP);
+  pinMode(BOOT_BTN_PIN, INPUT_PULLUP);
+
+  // OLED Init
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    display.clearDisplay();
+    display.setTextColor(SSD1306_WHITE);
+    display.setTextSize(1);
+  }
+
+  // Bluetooth Classic Init
+  SerialBT.begin("ESP32_Pro_RC");
+  
+  updateOLED("ACTIVE: MANUAL RC", "SPD: 0 Km/h [STOP]");
+}
+
+void loop() {
+  // --- 1. Cycle Button Press (External Button on GPIO 4) ---
+  bool cycleState = digitalRead(CYCLE_BTN_PIN);
+  if (cycleState == LOW && lastCycleState == HIGH) {
+    delay(50); // Debounce
+    selectedMode = (selectedMode == MODE_MANUAL_RC) ? MODE_AUTONOMOUS : MODE_MANUAL_RC;
+    
+    if (selectedMode == MODE_MANUAL_RC) {
+      updateOLED("SELECT: MANUAL RC", "Press BOOT to Set");
+    } else {
+      updateOLED("SELECT: AUTONOMOUS", "Press BOOT to Set");
+    }
+    delay(200);
+  }
+  lastCycleState = cycleState;
+
+  // --- 2. BOOT Button Confirm (Onboard Button on GPIO 0) ---
+  bool bootState = digitalRead(BOOT_BTN_PIN);
+  if (bootState == LOW && lastBootState == HIGH) {
+    delay(50); // Debounce
+    activeMode = selectedMode;
+    setMotors(0, 0); // Stop motors on mode shift
+
+    if (activeMode == MODE_MANUAL_RC) {
+      updateOLED("ACTIVE: MANUAL RC", "SPD: 0 Km/h [STOP]");
+    } else {
+      updateOLED("ACTIVE: AUTONOMOUS", "Avoiding Obstacles");
+    }
+    delay(300);
+  }
+  lastBootState = bootState;
+
+  // --- 3. Read Bluetooth Commands ---
+  if (SerialBT.available()) {
+    char cmd = SerialBT.read();
+    
+    if (cmd == 'M' || cmd == 'm') {
+      activeMode = (activeMode == MODE_MANUAL_RC) ? MODE_AUTONOMOUS : MODE_MANUAL_RC;
+      selectedMode = activeMode;
+      setMotors(0, 0);
+      updateOLED(activeMode == MODE_AUTONOMOUS ? "ACTIVE: AUTONOMOUS" : "ACTIVE: MANUAL RC", "Mode Swapped (BT)");
+    } 
+    else if (activeMode == MODE_MANUAL_RC) {
+      handleCommand(cmd);
+    }
+  }
+
+  // --- 4. Autonomous Logic ---
+  if (activeMode == MODE_AUTONOMOUS) {
+    runAutoModeLogic();
+  }
+
+  // --- 5. Periodically Send Speed Telemetry to App ---
+  if (millis() - lastSpeedTime > 200) {
+    lastSpeedTime = millis();
+    sendSpeedToApp();
+  }
+}
+
+int getSpeedKmh() {
+  if (currentDirection == 'S') return 0; // Stationary
+  
+  // Maps PWM (100 - 255) to a realistic 0 - 25 Km/h range
+  return map(currentSpeedPWM, 0, 255, 0, 25);
+}
+
+void sendSpeedToApp() {
+  int speedKmh = getSpeedKmh();
+  SerialBT.print("*S" + String(speedKmh) + " Km/h*"); 
+}
+
+// ---- Autonomous Obstacle Avoidance ----
+void runAutoModeLogic() {
+  if (millis() - lastSensorTime > 60) {
+    lastSensorTime = millis();
+    currentDistance = readDistance();
+
+    updateOLED("ACTIVE: AUTONOMOUS", "Dist: " + String(currentDistance) + " cm");
+
+    if (currentDistance > 25) {
+      setMotors(160, 160); // Path clear -> Move forward
+    } else {
+      // Obstacle detected -> Stop, Reverse & Turn
+      setMotors(0, 0);
+      delay(150);
+      setMotors(-150, -150);
+      delay(300);
+      setMotors(180, -180);
+      delay(400);
+      setMotors(0, 0);
+    }
+  }
+}
+
+// ---- Command Handler ----
+void handleCommand(char cmd) {
+  // Speed mode presets
+  if (cmd == '1') currentSpeedPWM = 120;       // Slow
+  else if (cmd == '2') currentSpeedPWM = 180;  // Medium
+  else if (cmd == '3') currentSpeedPWM = 220;  // Fast
+  else if (cmd == '4' || cmd == 'q') currentSpeedPWM = 255; // Turbo
+
+  // Steering controls
+  if (cmd == 'F' || cmd == 'B' || cmd == 'L' || cmd == 'R' || 
+      cmd == 'G' || cmd == 'I' || cmd == 'H' || cmd == 'J' || cmd == 'S') {
+    currentDirection = cmd;
+    applyMovement();
+  }
+}
+
+void applyMovement() {
+  int turnSpeed = currentSpeedPWM / 2;
+  int kmh = getSpeedKmh();
+
+  switch (currentDirection) {
+    case 'F': setMotors(currentSpeedPWM, currentSpeedPWM); updateOLED("MANUAL RC: FWD", "SPD: " + String(kmh) + " Km/h"); break;
+    case 'B': setMotors(-currentSpeedPWM, -currentSpeedPWM); updateOLED("MANUAL RC: REV", "SPD: " + String(kmh) + " Km/h"); break;
+    case 'L': setMotors(-currentSpeedPWM, currentSpeedPWM); updateOLED("MANUAL RC: LEFT", "SPD: " + String(kmh) + " Km/h"); break;
+    case 'R': setMotors(currentSpeedPWM, -currentSpeedPWM); updateOLED("MANUAL RC", "TURN RIGHT"); break;
+    case 'G': setMotors(turnSpeed, currentSpeedPWM); updateOLED("MANUAL RC: CURV L", "SPD: " + String(kmh) + " Km/h"); break;
+    case 'I': setMotors(currentSpeedPWM, turnSpeed); updateOLED("MANUAL RC: CURV R", "SPD: " + String(kmh) + " Km/h"); break;
+    case 'S': setMotors(0, 0); updateOLED("MANUAL RC: STOP", "SPD: 0 Km/h"); break;
+    default: setMotors(0, 0); break;
+  }
+}
+
+long readDistance() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  long duration = pulseIn(ECHO_PIN, HIGH, 15000); 
+  long dist = duration * 0.034 / 2;
+  return (dist == 0) ? 999 : dist;
+}
+
+void updateOLED(String line1, String line2) {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println(line1);
+  display.setCursor(0, 16);
+  display.println(line2);
+  display.display();
+}
+
+void setMotors(int speedLeft, int speedRight) {
+  if (speedLeft >= 0) {
+    digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW);
+    analogWrite(PWMA, speedLeft);
+  } else {
+    digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH);
+    analogWrite(PWMA, abs(speedLeft));
+  }
+
+  if (speedRight >= 0) {
+    digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW);
+    analogWrite(PWMB, speedRight);
+  } else {
+    digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH);
+    analogWrite(PWMB, abs(speedRight));
+  }
+}
