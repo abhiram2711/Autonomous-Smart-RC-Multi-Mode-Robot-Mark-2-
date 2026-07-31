@@ -34,3 +34,7 @@ Maintaining clear decoupling between high-current inductive motor draws and sens
 
 ### 🛡️ Signal Safety & Logic Level Tolerance
 The HC-SR04 $5\text{V}$ `Echo` output is dangerous to the ESP32’s $3.3\text{V}$ GPIO tolerance. This schematic integrates a simple voltage divider ($1\text{k}\Omega / 2\text{k}\Omega$) on this critical line to reduce the pulse to safe $3.3\text{V}$ logic levels.
+
+<img width="1280" height="960" alt="4f4d1c7f-ab72-4b8e-9a74-bc4262cafc54" src="https://github.com/user-attachments/assets/33a9a334-2741-4a74-b558-88d29f67b639" />
+<img width="960" height="1280" alt="59611923-6a18-44fa-b5c5-94bb697bd508" src="https://github.com/user-attachments/assets/773f2707-f8ad-4c6d-a7b5-b843409cf1ac" />
+<img width="875" height="1216" alt="28143122-fc1c-4678-95b4-e06f5aa9a56e" src="https://github.com/user-attachments/assets/7a06b3f1-c4d0-4a8a-9128-c773ac3b6e8c" />
